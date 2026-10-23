@@ -5,7 +5,9 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+# Auto-generated PyInstaller specs (not our build.spec)
 *.spec
+!build.spec
 venv/
 .venv/
 env/
