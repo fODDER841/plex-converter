@@ -20,11 +20,11 @@ class VideoInfo:
         return "Re-encode → H.264" if self.needs_reencode else "Remux (stream copy)"
 
 
-def probe(path: str) -> VideoInfo:
+def probe(path: str, ffprobe_exe: str = "ffprobe") -> VideoInfo:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "quiet",
+                ffprobe_exe, "-v", "quiet",
                 "-print_format", "json",
                 "-show_streams", "-show_format",
                 path,
@@ -32,10 +32,17 @@ def probe(path: str) -> VideoInfo:
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
         )
     except FileNotFoundError:
         raise RuntimeError(
-            "ffprobe not found. Install ffmpeg and make sure it is on your PATH."
+            f"ffprobe not found at: {ffprobe_exe}\n"
+            "Use the FFmpeg Settings button to locate the binaries."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "ffprobe timed out after 30 seconds. "
+            "The file may be on slow storage or corrupt."
         )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"ffprobe failed:\n{e.stderr}")

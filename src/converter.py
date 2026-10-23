@@ -6,8 +6,10 @@ from typing import Callable
 from .probe import VideoInfo
 
 
-def _build_cmd(input_path: str, output_path: str, info: VideoInfo) -> list[str]:
-    cmd = ["ffmpeg", "-y", "-i", input_path]
+def build_cmd(
+    input_path: str, output_path: str, info: VideoInfo, ffmpeg_exe: str = "ffmpeg"
+) -> list[str]:
+    cmd = [ffmpeg_exe, "-y", "-i", input_path]
 
     if info.needs_reencode:
         # Cap at 1080p; keep original resolution if smaller.
@@ -35,12 +37,15 @@ def convert(
     input_path: str,
     output_path: str,
     info: VideoInfo,
-    progress_callback: Callable[[float], None],
-    cancel_event: threading.Event,
+    ffmpeg_exe: str = "ffmpeg",
+    progress_callback: Callable[[float], None] = lambda _: None,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    if cancel_event is None:
+        cancel_event = threading.Event()
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    cmd = _build_cmd(input_path, output_path, info)
+    cmd = build_cmd(input_path, output_path, info, ffmpeg_exe)
 
     try:
         proc = subprocess.Popen(
@@ -54,7 +59,8 @@ def convert(
         )
     except FileNotFoundError:
         raise RuntimeError(
-            "ffmpeg not found. Install ffmpeg and make sure it is on your PATH."
+            f"ffmpeg not found at: {ffmpeg_exe}\n"
+            "Use the FFmpeg Settings button to locate the binaries."
         )
 
     # Drain stderr in a background thread so it never blocks the main pipe.
