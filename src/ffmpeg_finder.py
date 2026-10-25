@@ -10,7 +10,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _pair(directory: Path) -> tuple[str, str] | None:
@@ -80,6 +83,7 @@ def get_version(exe: str) -> str:
         result = subprocess.run(
             [exe, "-version"],
             capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW,
         )
         first = result.stdout.split("\n")[0].strip()
         return first if first else "(version unknown)"

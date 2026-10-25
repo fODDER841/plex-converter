@@ -1,7 +1,10 @@
 import os
 import subprocess
+import sys
 import threading
 from typing import Callable
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 from .probe import VideoInfo
 
@@ -56,6 +59,7 @@ def convert(
             bufsize=1,
             encoding="utf-8",
             errors="replace",
+            creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
         raise RuntimeError(

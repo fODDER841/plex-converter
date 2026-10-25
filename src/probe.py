@@ -1,6 +1,9 @@
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Codecs Plex handles natively — remux only, no re-encode needed.
 _COMPATIBLE = frozenset({"h264", "hevc", "h265"})
@@ -33,6 +36,7 @@ def probe(path: str, ffprobe_exe: str = "ffprobe") -> VideoInfo:
             text=True,
             check=True,
             timeout=30,
+            creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
         raise RuntimeError(
