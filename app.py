@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -12,6 +13,7 @@ import tkinterdnd2
 
 import src.config as config
 import src.ffmpeg_finder as finder
+import src.ffmpeg_installer as installer
 from src.converter import build_cmd, convert
 from src.naming import ParsedName, parse_filename, plex_movie_path, plex_tv_path
 from src.probe import VideoInfo, probe
@@ -144,7 +146,7 @@ class FFmpegSettingsDialog(ctk.CTkToplevel):
     def _browse(self) -> None:
         d = filedialog.askdirectory(title="Select folder containing ffmpeg.exe")
         if d:
-            self._dir_var.set(d)
+            self._dir_var.set(finder.find_in_folder(d) or d)
 
     def _apply(self) -> None:
         configured = self._dir_var.get().strip() or None
@@ -168,6 +170,319 @@ class FFmpegSettingsDialog(ctk.CTkToplevel):
 
 
 # ---------------------------------------------------------------------------
+# First-run FFmpeg setup dialog
+# ---------------------------------------------------------------------------
+
+_GREEN = "#3a9e3a"
+_RED = "#c0392b"
+_LINK = ("#1f6aa5", "#5aa9e6")
+
+
+class FFmpegSetupDialog(ctk.CTkToplevel):
+    """
+    Plain-language setup shown when FFmpeg can't be found. Views:
+    checking -> choose | no_winget -> installing -> success | restart | error
+    """
+
+    def __init__(self, parent: "App") -> None:
+        super().__init__(parent)
+        self._parent = parent
+        self._winget: str | None = None
+        self._view = ""
+        self._busy = False
+
+        self.title("Plex Converter — Setup")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        ctk.CTkLabel(
+            self, text="One quick step before you start",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(padx=24, pady=(20, 6), anchor="w")
+
+        self._intro = ctk.CTkLabel(
+            self,
+            text=(
+                "Plex Converter relies on a free helper program called FFmpeg to do "
+                "the actual video conversion. It isn't on this computer yet, so "
+                "videos can't be converted until it's added."
+            ),
+            wraplength=440, justify="left", anchor="w",
+        )
+        self._intro.pack(padx=24, pady=(0, 12), fill="x")
+
+        self._body = ctk.CTkFrame(self, fg_color="transparent")
+        self._body.pack(padx=24, pady=(0, 8), fill="x")
+
+        self._footer = ctk.CTkFrame(self, fg_color="transparent")
+        self._footer.pack(padx=24, pady=(4, 18), fill="x")
+        self._close_btn = ctk.CTkButton(
+            self._footer, text="Not now", width=90,
+            fg_color="gray40", hover_color="gray30", command=self._close,
+        )
+        self._close_btn.pack(side="right")
+
+        self._show_checking()
+        self.after(10, self._raise)
+        threading.Thread(target=self._detect_winget, daemon=True).start()
+
+    # ------------------------------------------------------------- helpers
+
+    def _raise(self) -> None:
+        self.update_idletasks()
+        p = self._parent
+        x = p.winfo_rootx() + (p.winfo_width() - self.winfo_width()) // 2
+        y = p.winfo_rooty() + max((p.winfo_height() - self.winfo_height()) // 3, 0)
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.lift()
+        self.focus_force()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _clear(self, view: str) -> None:
+        self._view = view
+        for w in self._body.winfo_children():
+            w.destroy()
+
+    def _text(self, text: str, **kw) -> ctk.CTkLabel:
+        lbl = ctk.CTkLabel(
+            self._body, text=text, wraplength=440, justify="left", anchor="w", **kw
+        )
+        lbl.pack(fill="x", pady=(0, 8))
+        return lbl
+
+    def _link(self, text: str, command) -> ctk.CTkButton:
+        btn = ctk.CTkButton(
+            self._body, text=text, command=command, fg_color="transparent",
+            hover=False, text_color=_LINK, anchor="w", height=24,
+            font=ctk.CTkFont(underline=True),
+        )
+        btn.pack(anchor="w", pady=(0, 4))
+        return btn
+
+    def _close(self) -> None:
+        if self._busy:
+            return  # don't abandon a running install
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        self._parent._refresh_gate()
+
+    # ------------------------------------------------------------- views
+
+    def _show_checking(self) -> None:
+        self._clear("checking")
+        self._text("Checking this computer…", text_color="gray60")
+
+    def _detect_winget(self) -> None:
+        exe = installer.find_winget()
+        self.after(0, lambda: self._on_winget_detected(exe))
+
+    def _on_winget_detected(self, exe: str | None) -> None:
+        self._winget = exe
+        if exe:
+            self._show_choose()
+        else:
+            self._show_no_winget()
+
+    def _show_choose(self, note: str = "") -> None:
+        self._clear("choose")
+        self._install_btn = ctk.CTkButton(
+            self._body, text="Install automatically", height=40, width=220,
+            font=ctk.CTkFont(size=14, weight="bold"), command=self._start_install,
+        )
+        self._install_btn.pack(anchor="w", pady=(4, 6))
+        self._text(
+            "Recommended. Downloads FFmpeg (about 100 MB) from Microsoft's official "
+            "app library and sets it up for you. Usually takes a minute or two.",
+            text_color="gray60",
+        )
+        self._browse_btn = self._link("I already have FFmpeg — let me find it", self._browse)
+        self._browse_note = self._text(note, text_color=_RED) if note else None
+
+    def _show_no_winget(self, note: str = "") -> None:
+        self._clear("no_winget")
+        self._text(
+            "This computer can't install FFmpeg automatically, because it's missing "
+            "a free Windows add-on called App Installer. You have two options:"
+        )
+        self._text("Option 1 (easiest): get App Installer, then come back here.",
+                   font=ctk.CTkFont(weight="bold"))
+        row = ctk.CTkFrame(self._body, fg_color="transparent")
+        row.pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(
+            row, text="Get App Installer", width=160,
+            command=lambda: webbrowser.open(installer.APP_INSTALLER_URL),
+        ).pack(side="left", padx=(0, 8))
+        self._recheck_btn = ctk.CTkButton(
+            row, text="I've installed it — check again", width=210,
+            fg_color="gray40", hover_color="gray30", command=self._recheck_winget,
+        )
+        self._recheck_btn.pack(side="left")
+        self._text("Option 2: download FFmpeg yourself, then show us where it is.",
+                   font=ctk.CTkFont(weight="bold"))
+        self._link("Download FFmpeg (a .zip file, about 100 MB)",
+                   lambda: webbrowser.open(installer.FFMPEG_DOWNLOAD_URL))
+        self._text(f"{installer.FFMPEG_DOWNLOAD_URL}\nWhen it finishes, right-click the "
+                   "file, choose \"Extract All…\", then use the link below.",
+                   text_color="gray60")
+        self._browse_btn = self._link("I've downloaded it — let me find the folder", self._browse)
+        self._browse_note = self._text(note, text_color=_RED) if note else None
+
+    def _recheck_winget(self) -> None:
+        self._show_checking()
+        threading.Thread(target=self._detect_winget, daemon=True).start()
+
+    def _show_installing(self) -> None:
+        self._clear("installing")
+        self._status = self._text("Getting ready…")
+        self._bar = ctk.CTkProgressBar(self._body, width=440, mode="indeterminate")
+        self._bar.pack(fill="x", pady=(0, 8))
+        self._bar.start()
+        self._bar_determinate = False
+        self._text("Please keep this window open. This can take a few minutes on a "
+                   "slower connection.", text_color="gray60")
+
+    def _show_success(self) -> None:
+        self._clear("success")
+        self._intro.pack_forget()
+        self._text("✓  All set! Plex Converter is ready to use.",
+                   text_color=_GREEN, font=ctk.CTkFont(size=14, weight="bold"))
+        self._close_btn.configure(text="Start converting", fg_color=_GREEN,
+                                  hover_color="#2e7d2e", width=140)
+
+    def _show_restart(self) -> None:
+        self._clear("restart")
+        self._text(
+            "FFmpeg was installed, but Plex Converter needs to be restarted before "
+            "it can use it.\n\nPlease close Plex Converter and open it again.",
+            font=ctk.CTkFont(weight="bold"),
+        )
+        self._close_btn.configure(text="Close Plex Converter", width=170,
+                                  command=self._parent.destroy)
+
+    def _show_error(self, result: installer.InstallResult) -> None:
+        self._clear("error")
+        self._text("The installation didn't finish.", text_color=_RED,
+                   font=ctk.CTkFont(size=14, weight="bold"))
+        self._text("Make sure this computer is connected to the internet, then try "
+                   "again. If it keeps failing, you can download FFmpeg yourself "
+                   "and show us where it is.")
+        row = ctk.CTkFrame(self._body, fg_color="transparent")
+        row.pack(fill="x", pady=(0, 6))
+        self._install_btn = ctk.CTkButton(row, text="Try again", width=120,
+                                          command=self._start_install)
+        self._install_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            row, text="Download it myself", width=150, fg_color="gray40", hover_color="gray30",
+            command=lambda: webbrowser.open(installer.FFMPEG_DOWNLOAD_URL),
+        ).pack(side="left")
+        self._browse_btn = self._link("I already have FFmpeg — let me find it", self._browse)
+
+        details = ctk.CTkTextbox(self._body, height=110, width=440, wrap="word")
+        details.insert("1.0", f"Error code: {result.returncode:#x}\n\n{result.output}"
+                       if result.returncode >= 0 else result.output)
+        details.configure(state="disabled")
+
+        def _toggle() -> None:
+            if details.winfo_ismapped():
+                details.pack_forget()
+                toggle.configure(text="Show technical details")
+            else:
+                details.pack(fill="x", pady=(4, 0))
+                toggle.configure(text="Hide technical details")
+
+        toggle = self._link("Show technical details", _toggle)
+
+    # ------------------------------------------------------------- actions
+
+    def _start_install(self) -> None:
+        if not self._winget:
+            return
+        self._busy = True
+        self._close_btn.configure(state="disabled")
+        self._show_installing()
+        winget = self._winget
+
+        def _work() -> None:
+            try:
+                result = installer.install(
+                    winget, on_progress=lambda p: self.after(0, lambda p=p: self._on_progress(p))
+                )
+            except Exception as exc:  # winget vanished, access denied, etc.
+                result = installer.InstallResult(-1, str(exc))
+            self.after(0, lambda: self._on_install_done(result))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_progress(self, p: installer.Progress) -> None:
+        if self._view != "installing":
+            return
+        if p.stage == "downloading":
+            msg = "Downloading FFmpeg…" + (f"  {p.detail}" if p.detail else "")
+        elif p.stage == "installing":
+            msg = "Setting it up…"
+        else:
+            msg = "Working…"
+        self._status.configure(text=msg)
+
+        if p.fraction is not None:
+            if not self._bar_determinate:
+                self._bar.stop()
+                self._bar.configure(mode="determinate")
+                self._bar_determinate = True
+            self._bar.set(p.fraction)
+        elif self._bar_determinate and p.stage == "installing":
+            self._bar.configure(mode="indeterminate")
+            self._bar.start()
+            self._bar_determinate = False
+
+    def _on_install_done(self, result: installer.InstallResult) -> None:
+        self._busy = False
+        self._close_btn.configure(state="normal")
+        app = self._parent
+
+        # winget's exit code isn't trustworthy (e.g. "already installed" is
+        # non-zero), so success means "we can find it now".
+        app._resolve_ffmpeg()
+        if not app._ffmpeg_exe:
+            finder.refresh_path_from_registry()
+            app._resolve_ffmpeg()
+
+        if app._ffmpeg_exe:
+            self._show_success()
+        elif result.returncode == 0:
+            self._show_restart()
+        else:
+            self._show_error(result)
+
+    def _browse(self) -> None:
+        d = filedialog.askdirectory(parent=self, title="Choose the FFmpeg folder")
+        if not d:
+            return
+        found = finder.find_in_folder(d)
+        if found:
+            app = self._parent
+            app._cfg["ffmpeg_dir"] = found
+            config.save(app._cfg)
+            app._resolve_ffmpeg(configured_dir=found)
+        if found and self._parent._ffmpeg_exe:
+            self._show_success()
+            return
+        note = ("FFmpeg isn't in that folder. Choose the folder you got from "
+                "\"Extract All\" — it contains a folder named \"bin\".")
+        if self._view == "no_winget":
+            self._show_no_winget(note)
+        else:
+            self._show_choose(note)
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -184,12 +499,14 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._ffmpeg_exe: str | None = None
         self._ffprobe_exe: str | None = None
         self._ffmpeg_source: str = "not found"
+        self._ffmpeg_checked = False  # avoid flashing "setup needed" before first resolve
 
         # conversion state
         self._input_file: str | None = None
         self._video_info: VideoInfo | None = None
         self._cancel = threading.Event()
         self._last_cmd: str | None = None
+        self._setup_dialog: FFmpegSetupDialog | None = None
 
         self._build_ui()
         self._set_state("idle")
@@ -206,12 +523,20 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._ffmpeg_exe = ffmpeg
         self._ffprobe_exe = ffprobe
         self._ffmpeg_source = source
+        self._ffmpeg_checked = True
         self._update_ffmpeg_indicator()
 
     def _initial_ffmpeg_check(self) -> None:
         self._resolve_ffmpeg()
         if not self._ffmpeg_exe:
-            FFmpegSettingsDialog(self)
+            self._open_setup()
+
+    def _open_setup(self) -> None:
+        if self._setup_dialog is not None and self._setup_dialog.winfo_exists():
+            self._setup_dialog.lift()
+            self._setup_dialog.focus_force()
+            return
+        self._setup_dialog = FFmpegSetupDialog(self)
 
     def _update_ffmpeg_indicator(self) -> None:
         if self._ffmpeg_exe:
@@ -223,6 +548,20 @@ class App(tkinterdnd2.TkinterDnD.Tk):
             self._ffmpeg_status_label.configure(
                 text="ffmpeg: not found", text_color="#c0392b"
             )
+        self._refresh_gate()
+
+    def _idle_drop_text(self) -> str:
+        if not self._ffmpeg_checked or (self._ffmpeg_exe and self._ffprobe_exe):
+            return "Drop a video file here\nor click to browse"
+        return "Setup isn't finished — videos can't be converted yet.\nClick here to finish setup."
+
+    def _refresh_gate(self) -> None:
+        """Reflect ffmpeg availability in the drop zone while no file is loaded."""
+        if self._input_file is not None:
+            return
+        ready = not self._ffmpeg_checked or bool(self._ffmpeg_exe and self._ffprobe_exe)
+        self._drop_label.configure(text=self._idle_drop_text())
+        self._drop_frame.configure(border_color="gray50" if ready else "#c0392b")
 
     # ------------------------------------------------------------------ layout
 
@@ -392,7 +731,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._cancel_btn.pack_forget()
 
         if state == "idle":
-            self._drop_label.configure(text="Drop a video file here\nor click to browse")
+            self._refresh_gate()
 
         elif state == "loaded":
             self._info_label.pack(pady=(6, 0))
@@ -427,6 +766,9 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._load_file(path)
 
     def _browse_file(self, _event: tk.Event | None = None) -> None:
+        if not self._ffprobe_exe:
+            self._open_setup()
+            return
         ext_str = " ".join(f"*{e}" for e in VIDEO_EXTENSIONS)
         path = filedialog.askopenfilename(
             title="Select a video file",
@@ -451,15 +793,13 @@ class App(tkinterdnd2.TkinterDnD.Tk):
     # ------------------------------------------------------------------ probe
 
     def _load_file(self, path: str) -> None:
-        if not os.path.isfile(path):
-            messagebox.showerror("File not found", f"Cannot read:\n{path}")
+        # Check setup first so a dropped file leads to the fix, not an error.
+        if not self._ffprobe_exe:
+            self._open_setup()
             return
 
-        if not self._ffprobe_exe:
-            messagebox.showerror(
-                "ffprobe not found",
-                "ffprobe is not configured.\n\nClick 'FFmpeg Settings' in the toolbar to locate the binaries.",
-            )
+        if not os.path.isfile(path):
+            messagebox.showerror("File not found", f"Cannot read:\n{path}")
             return
 
         ext = Path(path).suffix.lower()
@@ -521,13 +861,10 @@ class App(tkinterdnd2.TkinterDnD.Tk):
 
     def _start_conversion(self) -> None:
         if not self._ffmpeg_exe:
-            messagebox.showerror(
-                "ffmpeg not found",
-                "ffmpeg is not configured.\n\nClick 'FFmpeg Settings' in the toolbar.",
-            )
+            self._open_setup()
             return
 
-        title = self._title_var.get().strip()
+        title =self._title_var.get().strip()
         year = self._year_var.get().strip() or None
         output_dir = self._output_var.get().strip()
 

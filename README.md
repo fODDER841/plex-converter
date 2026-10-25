@@ -12,11 +12,11 @@ Drag a file onto the window, confirm the title and year, and click **Convert**.
 | Python 3.10+ | https://www.python.org/downloads/ |
 | ffmpeg + ffprobe on PATH | https://ffmpeg.org/download.html |
 
-> **Quick ffmpeg install (winget):**
-> ```
-> winget install Gyan.FFmpeg
-> ```
-> Restart your terminal after installing so PATH is updated.
+> **ffmpeg doesn't need to be installed beforehand.** If the app can't find it at
+> startup, a setup dialog offers to install it automatically (via
+> `winget install --id Gyan.FFmpeg`), or to point at an existing folder. On older
+> Windows without winget, it links to App Installer and a direct ffmpeg .zip instead.
+> Conversion is disabled until setup succeeds; no restart is needed afterwards.
 
 ---
 
@@ -111,4 +111,18 @@ pip install pyinstaller
 pyinstaller --onefile --windowed app.py
 ```
 
-The executable will appear at `dist/app.exe`. You can distribute this single file to a machine that does not have Python installed (ffmpeg must still be on PATH).
+The executable will appear at `dist/app.exe`. You can distribute this single file to a machine that does not have Python installed; ffmpeg is set up on first run (see Requirements).
+
+---
+
+## Tests
+
+The first-run setup flow is tested against a sandbox with no ffmpeg (fake `winget`,
+isolated PATH/LOCALAPPDATA/settings):
+
+```bash
+python -m unittest tests.test_ffmpeg_setup -v
+```
+
+Set `SETUP_SCREENSHOTS=<dir>` to save a PNG of each dialog state, and
+`RUN_REAL_WINGET=1` to also invoke the real winget CLI.

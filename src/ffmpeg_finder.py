@@ -2,7 +2,7 @@
 Locate ffmpeg.exe and ffprobe.exe with a configurable search order:
   1. Configured directory (saved in settings)
   2. System PATH
-  3. WinGet package directories  (%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\*ffmpeg*)
+  3. WinGet package directories  (%LOCALAPPDATA% and %PROGRAMFILES% \\WinGet\\Packages\\*ffmpeg*)
   4. Common install locations
 """
 from __future__ import annotations
@@ -24,19 +24,67 @@ def _pair(directory: Path) -> tuple[str, str] | None:
     return None
 
 
+def _winget_package_dirs() -> list[Path]:
+    # User-scope installs (the default) and machine-scope installs.
+    return [
+        Path(os.environ.get("LOCALAPPDATA", "C:\\")) / "Microsoft" / "WinGet" / "Packages",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "WinGet" / "Packages",
+    ]
+
+
 def _search_winget() -> tuple[str, str] | None:
-    base = Path(os.environ.get("LOCALAPPDATA", "C:\\")) / "Microsoft" / "WinGet" / "Packages"
-    if not base.exists():
-        return None
-    for pkg_dir in base.iterdir():
-        if "ffmpeg" not in pkg_dir.name.lower():
+    for base in _winget_package_dirs():
+        if not base.exists():
             continue
-        # Walk into version subdirs looking for bin/ffmpeg.exe
-        for exe in pkg_dir.rglob("ffmpeg.exe"):
-            ffprobe = exe.parent / "ffprobe.exe"
-            if ffprobe.exists():
-                return str(exe), str(ffprobe)
+        for pkg_dir in base.iterdir():
+            if "ffmpeg" not in pkg_dir.name.lower():
+                continue
+            # Walk into version subdirs looking for bin/ffmpeg.exe
+            for exe in pkg_dir.rglob("ffmpeg.exe"):
+                ffprobe = exe.parent / "ffprobe.exe"
+                if ffprobe.exists():
+                    return str(exe), str(ffprobe)
     return None
+
+
+def find_in_folder(folder: str) -> str | None:
+    """
+    Return the directory holding ffmpeg.exe + ffprobe.exe within a user-picked
+    folder: the folder itself, its bin/, or anywhere up to two levels below.
+    """
+    root = Path(folder)
+    for d in (root, root / "bin"):
+        if _pair(d):
+            return str(d)
+    for pattern in ("*/ffmpeg.exe", "*/*/ffmpeg.exe"):
+        for exe in root.glob(pattern):
+            if _pair(exe.parent):
+                return str(exe.parent)
+    return None
+
+
+def refresh_path_from_registry() -> None:
+    """
+    Reload PATH from the registry so changes made by an installer after this
+    process started become visible without restarting the app.
+    """
+    if sys.platform != "win32":
+        return
+    import winreg
+
+    parts: list[str] = []
+    for hive, key in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                value, _ = winreg.QueryValueEx(k, "Path")
+                parts.append(os.path.expandvars(value))
+        except OSError:
+            continue
+    if parts:
+        os.environ["PATH"] = ";".join(parts)
 
 
 _COMMON_DIRS: list[Path] = [
