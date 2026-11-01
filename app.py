@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -14,7 +15,8 @@ import tkinterdnd2
 import src.config as config
 import src.ffmpeg_finder as finder
 import src.ffmpeg_installer as installer
-from src.converter import build_cmd, convert
+from src.batch_view import BatchView
+from src.converter import PART_SUFFIX, build_cmd, convert
 from src.naming import ParsedName, parse_filename, plex_movie_path, plex_tv_path
 from src.probe import VideoInfo, probe
 
@@ -507,8 +509,11 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._cancel = threading.Event()
         self._last_cmd: str | None = None
         self._setup_dialog: FFmpegSetupDialog | None = None
+        self._batch_view: BatchView | None = None
+        self._converting = False
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_state("idle")
 
         # Resolve ffmpeg; show setup dialog if missing.
@@ -552,12 +557,12 @@ class App(tkinterdnd2.TkinterDnD.Tk):
 
     def _idle_drop_text(self) -> str:
         if not self._ffmpeg_checked or (self._ffmpeg_exe and self._ffprobe_exe):
-            return "Drop a video file here\nor click to browse"
+            return "Drop a video file, several files, or a whole folder here\nor click to browse"
         return "Setup isn't finished — videos can't be converted yet.\nClick here to finish setup."
 
     def _refresh_gate(self) -> None:
         """Reflect ffmpeg availability in the drop zone while no file is loaded."""
-        if self._input_file is not None:
+        if self._input_file is not None or self._batch_view is not None:
             return
         ready = not self._ffmpeg_checked or bool(self._ffmpeg_exe and self._ffprobe_exe)
         self._drop_label.configure(text=self._idle_drop_text())
@@ -568,6 +573,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
     def _build_ui(self) -> None:
         outer = ctk.CTkFrame(self, corner_radius=0)
         outer.pack(fill="both", expand=True)
+        self._outer = outer
 
         # Title row
         title_row = ctk.CTkFrame(outer, fg_color="transparent")
@@ -609,7 +615,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
 
         self._drop_label = ctk.CTkLabel(
             self._drop_frame,
-            text="Drop a video file here\nor click to browse",
+            text="Drop a video file, several files, or a whole folder here\nor click to browse",
             font=ctk.CTkFont(size=14),
             cursor="hand2",
         )
@@ -619,6 +625,11 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._drop_frame.dnd_bind("<<Drop>>", self._on_drop)
         self._drop_label.bind("<Button-1>", self._browse_file)
         self._drop_frame.bind("<Button-1>", self._browse_file)
+
+        self._folder_btn = ctk.CTkButton(
+            outer, text="Convert a whole folder (TV series)…", width=260, height=28,
+            fg_color="gray30", hover_color="gray20", command=self._browse_folder,
+        )
 
         # --- codec info line ---
         self._info_label = ctk.CTkLabel(
@@ -729,8 +740,10 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._btn_frame.pack_forget()
         self._progress_frame.pack_forget()
         self._cancel_btn.pack_forget()
+        self._folder_btn.pack_forget()
 
         if state == "idle":
+            self._folder_btn.pack(pady=(8, 14))
             self._refresh_gate()
 
         elif state == "loaded":
@@ -759,23 +772,82 @@ class App(tkinterdnd2.TkinterDnD.Tk):
     # ------------------------------------------------------------------ events
 
     def _on_drop(self, event: tk.Event) -> None:
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1]
-        path = raw.split("} {")[0].strip("{}")
-        self._load_file(path)
+        self._open_paths(list(self.tk.splitlist(event.data)))
+
+    def _open_paths(self, paths: list[str]) -> None:
+        """One file -> single-file flow; several files or any folder -> batch."""
+        if not paths or self._converting:
+            return
+        if len(paths) == 1 and not os.path.isdir(paths[0]):
+            self._load_file(paths[0])
+            return
+        if not self._ffprobe_exe:
+            self._open_setup()
+            return
+        self._open_batch(paths)
 
     def _browse_file(self, _event: tk.Event | None = None) -> None:
         if not self._ffprobe_exe:
             self._open_setup()
             return
         ext_str = " ".join(f"*{e}" for e in VIDEO_EXTENSIONS)
-        path = filedialog.askopenfilename(
-            title="Select a video file",
+        paths = filedialog.askopenfilenames(
+            title="Select one or more video files",
             filetypes=[("Video files", ext_str), ("All files", "*.*")],
         )
-        if path:
-            self._load_file(path)
+        if paths:
+            self._open_paths(list(paths))
+
+    def _browse_folder(self) -> None:
+        if not self._ffprobe_exe:
+            self._open_setup()
+            return
+        d = filedialog.askdirectory(title="Choose a folder (subfolders are included)")
+        if d:
+            self._open_paths([os.path.normpath(d)])
+
+    # ------------------------------------------------------------------ batch
+
+    def _open_batch(self, paths: list[str]) -> None:
+        if self._batch_view is None:
+            self._reset()
+            self._drop_frame.pack_forget()
+            self._folder_btn.pack_forget()
+            self._batch_view = BatchView(self._outer, self, on_close=self._close_batch)
+            self._batch_view.pack(fill="both", expand=True, padx=16, pady=(10, 16))
+            self.resizable(True, True)
+            self.minsize(860, 560)
+            self.geometry("1040x700")
+        if not self._batch_view.add_paths(paths) and not self._batch_view.items:
+            self._close_batch()
+            messagebox.showinfo("No videos found",
+                                "No video files were found in what you dropped.")
+
+    def _close_batch(self) -> None:
+        if self._batch_view is None:
+            return
+        self._batch_view.destroy()
+        self._batch_view = None
+        self.minsize(1, 1)
+        self.geometry("")
+        self.resizable(False, False)
+        self._drop_frame.pack(padx=30, pady=(10, 0))
+        self._set_state("idle")
+
+    def _on_close(self) -> None:
+        bv = self._batch_view
+        if bv is not None and bv.running:
+            if not messagebox.askyesno(
+                "Batch is running",
+                "A batch is still converting. Stop it and quit?\n\nFinished files are "
+                "kept; running the same folder again continues where it left off.",
+            ):
+                return
+            bv.cancel_and_wait()
+        elif self._converting:
+            self._cancel.set()
+            time.sleep(0.5)  # let the watchdog kill ffmpeg and remove the partial file
+        self.destroy()
 
     def _browse_output(self) -> None:
         d = filedialog.askdirectory(title="Select output folder")
@@ -854,7 +926,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._set_state("loaded")
 
     def _on_probe_error(self, msg: str) -> None:
-        self._drop_label.configure(text="Drop a video file here\nor click to browse")
+        self._drop_label.configure(text=self._idle_drop_text())
         messagebox.showerror("Probe failed", f"Could not inspect file:\n\n{msg}")
 
     # ------------------------------------------------------------------ convert
@@ -891,7 +963,8 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         config.save(self._cfg)
 
         # Store command for diagnostics before the thread starts.
-        cmd = build_cmd(self._input_file, output_path, self._video_info, self._ffmpeg_exe)
+        cmd = build_cmd(self._input_file, output_path + PART_SUFFIX, self._video_info,
+                        self._ffmpeg_exe)
         self._last_cmd = " ".join(f'"{a}"' if " " in a else a for a in cmd)
 
         self._set_state("converting")
@@ -899,11 +972,13 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._status_label.configure(text=f"{op} to MKV...")
 
         self._cancel.clear()
+        self._converting = True
 
         # Capture locals for the thread.
         src = self._input_file
         info = self._video_info
         ffmpeg_exe = self._ffmpeg_exe
+        ffprobe_exe = self._ffprobe_exe
 
         def _do_convert() -> None:
             try:
@@ -914,6 +989,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
                         0, lambda p=p: self._update_progress(p)
                     ),
                     cancel_event=self._cancel,
+                    ffprobe_exe=ffprobe_exe,
                 )
                 self.after(0, lambda: self._on_done(output_path))
             except Exception as exc:
@@ -927,6 +1003,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._pct_label.configure(text=f"{int(fraction * 100)}%")
 
     def _on_done(self, output_path: str) -> None:
+        self._converting = False
         self._progress_bar.set(1.0)
         self._pct_label.configure(text="100%")
         self._status_label.configure(
@@ -935,6 +1012,7 @@ class App(tkinterdnd2.TkinterDnD.Tk):
         self._set_state("done")
 
     def _on_error(self, msg: str) -> None:
+        self._converting = False
         short = msg[:400] + ("..." if len(msg) > 400 else "")
         self._status_label.configure(text=f"Error:\n{short}", text_color="#c0392b")
         self._set_state("error")

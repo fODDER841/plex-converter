@@ -173,7 +173,8 @@ class SetupSandbox(unittest.TestCase):
         self.assertIsNotNone(self.app._ffmpeg_exe)
         self.assertIsNotNone(self.app._ffprobe_exe)
         self.assertEqual(self.app._drop_label.cget("text"),
-                         "Drop a video file here\nor click to browse")
+                         "Drop a video file, several files, or a whole folder here\n"
+                         "or click to browse")
 
 
 class TestMissingWithWinget(SetupSandbox):
